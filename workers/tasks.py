@@ -13,12 +13,15 @@ class SyncWorker(QThread):
     finished = Signal(dict)
     error = Signal(str)
 
-    def __init__(self, video_path: str, audio_path: str, video_dur: float, audio_dur: float):
+    def __init__(self, video_path: str, audio_path: str, video_dur: float, audio_dur: float, 
+                 video_audio_idx: int = 0, target_audio_idx: int = 0):
         super().__init__()
         self.video_path = video_path
         self.audio_path = audio_path
         self.video_dur = video_dur
         self.audio_dur = audio_dur
+        self.video_audio_idx = video_audio_idx
+        self.target_audio_idx = target_audio_idx
         self._cancelled = False
 
     def cancel(self):
@@ -27,40 +30,78 @@ class SyncWorker(QThread):
     def run(self):
         try:
             anchor_dur = min(self.video_dur, self.audio_dur)
-            pontos_pct = [0.0, 0.20, 0.40, 0.60, 0.80]
+
+            # ── JANELA SEGURA ──
+            # Descarta ~3 min iniciais (vinhetas/recap) e 10% finais (créditos).
+            inicio = min(180.0, anchor_dur * 0.10)
+            fim = anchor_dur * 0.90
+            if fim - inicio < 600.0:          # arquivo curto: sem corte
+                inicio, fim = 0.0, anchor_dur
+
+            # ── GRADE FIXA: 9 cortes dentro da janela ──
+            # Âncora com chunks grandes (busca larga); demais pontos com chunks leves.
+            REF_ANCORA, ALVO_ANCORA = 240.0, 540.0   # âncora: margem ±150 s
+            REF_PONTO,  ALVO_PONTO  = 120.0, 300.0   # pontos: margem ±90 s
+            grade_inicio = inicio
+            grade_fim = (fim - REF_ANCORA) if (fim - REF_ANCORA) > inicio else fim
+            n_pontos = 9
+            pontos = [grade_inicio + (grade_fim - grade_inicio) * i / (n_pontos - 1)
+                      for i in range(n_pontos)]
+
             offsets, x_times = [], []
-            self.progress.emit(tr("prog_ponto0"), 10)
-            offset_0 = calculate_sync_offset(self.video_path, self.audio_path, 0.0, 0.0, 360, 360)
+
+            # Âncora: primeira medição da janela, chunks grandes, busca larga
+            self.progress.emit(tr("prog_ponto").format(pct=int(pontos[0] / anchor_dur * 100)), 10)
+            offset_0 = calculate_sync_offset(
+                self.video_path, self.audio_path, pontos[0], max(0.0, pontos[0] - 150.0),
+                REF_ANCORA, ALVO_ANCORA,
+                self.video_audio_idx, self.target_audio_idx
+            )
             if self._cancelled:
                 self.error.emit(tr("op_cancelada_usuario"))
                 return
+
             offsets.append(offset_0)
-            x_times.append(0.0)
-            for i, pct in enumerate(pontos_pct[1:]):
+            x_times.append(pontos[0])
+
+            # Demais pontos: chunks reduzidos (mais rápido), janela centrada pelo offset_0
+            for i, t_ref in enumerate(pontos[1:], start=1):
                 if self._cancelled:
                     self.error.emit(tr("op_cancelada_usuario"))
                     return
-                pct_int = int(pct * 100)
-                self.progress.emit(tr("prog_ponto").format(pct=pct_int), 20 + (i * 15))
-                start_ref = anchor_dur * pct
-                start_target = max(0.0, start_ref - offset_0 - 150)
-                off = calculate_sync_offset(self.video_path, self.audio_path, start_ref, start_target, 240, 540)
+
+                self.progress.emit(
+                    tr("prog_ponto").format(pct=int(t_ref / anchor_dur * 100)),
+                    10 + int(80 * i / (n_pontos - 1))
+                )
+
+                start_target = max(0.0, t_ref - offset_0 - 90.0)
+                off = calculate_sync_offset(
+                    self.video_path, self.audio_path, t_ref, start_target, REF_PONTO, ALVO_PONTO,
+                    self.video_audio_idx, self.target_audio_idx
+                )
                 if self._cancelled:
                     self.error.emit(tr("op_cancelada_usuario"))
                     return
+
                 offsets.append(off)
-                x_times.append(start_ref)
+                x_times.append(t_ref)
+
             self.progress.emit(tr("prog_regressao"), 90)
+
             res = stats.theilslopes(offsets, x_times)
             slope, offset_A = res[0], res[1]
             speed_factor = 1.0 - slope
+
             self.progress.emit(tr("prog_analise_concluida"), 100)
+
             self.finished.emit({
                 "offset": offset_A,
                 "speed_factor": speed_factor,
                 "diff_percent": (speed_factor - 1) * 100,
                 "effective_video_dur": self.video_dur - max(0, offset_A)
             })
+
         except Exception as e:
             if self._cancelled:
                 self.error.emit(tr("op_cancelada_usuario"))
@@ -73,11 +114,12 @@ class FFmpegWorker(QThread):
     finished = Signal(str)
     error = Signal(str)
 
-    def __init__(self, cmd: list, target_duration: float, output_path: str):
+    def __init__(self, cmd: list, target_duration: float, output_path: str, stage_text: str = ""):
         super().__init__()
         self.cmd = cmd
         self.target_duration = target_duration
         self.output_path = output_path
+        self.stage_text = stage_text
         self._is_cancelled = False
         self.process = None
 
@@ -89,15 +131,19 @@ class FFmpegWorker(QThread):
     def run(self):
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+
             self.process = subprocess.Popen(
                 self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 universal_newlines=True, encoding='utf-8', errors='replace',
                 creationflags=creationflags
             )
+
             start_time = time.time()
+
             for line in self.process.stdout:
                 if self._is_cancelled:
                     break
+
                 if 'out_time_us=' in line:
                     us_str = line.strip().split('=')[1]
                     if us_str.lstrip('-').isdigit():
@@ -106,15 +152,34 @@ class FFmpegWorker(QThread):
                         remaining = (elapsed / (percent / 100) - elapsed) if percent > 0 else 0
                         rem_m, rem_s = divmod(int(remaining), 60)
                         rem_h, rem_m = divmod(rem_m, 60)
-                        self.progress.emit(tr("prog_faltam").format(tempo=f"{rem_h:02d}:{rem_m:02d}:{rem_s:02d}"), percent)
+                        faltam_texto = tr("prog_faltam").format(tempo=f"{rem_h:02d}:{rem_m:02d}:{rem_s:02d}")
+
+                        if self.stage_text:
+                            msg = f"{self.stage_text}    {faltam_texto}"
+                        else:
+                            msg = faltam_texto
+
+                        self.progress.emit(msg, percent)
+
             self.process.wait()
+
             if self._is_cancelled:
                 self.error.emit(tr("op_cancelada_usuario"))
                 if os.path.exists(self.output_path):
-                    os.remove(self.output_path)
+                    try: os.remove(self.output_path)
+                    except Exception: pass
+
             elif self.process.returncode != 0:
-                self.error.emit(tr("falha_ffmpeg_codigo").format(code=self.process.returncode))
+                if self.process.returncode in (-28, 4294967268):
+                    self.error.emit(tr("falha_espaco"))
+                else:
+                    self.error.emit(tr("falha_ffmpeg_codigo").format(code=self.process.returncode))
+
+                if os.path.exists(self.output_path):
+                    try: os.remove(self.output_path)
+                    except Exception: pass
             else:
                 self.finished.emit(self.output_path)
+
         except Exception as e:
             self.error.emit(str(e))

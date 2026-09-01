@@ -20,11 +20,20 @@ WINGET_ID: str = "Gyan.FFmpeg"
 FALLBACK_URL: str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
 USER_AGENT: str = "DublaSync/1.0"
 
-
-def _creationflags() -> int:
-    """Evita a abertura de janela de console no Windows."""
-    return subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-
+def run_ffmpeg_subprocess(cmd: list, timeout: int = 15, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    """Wrapper centralizado para chamadas do FFmpeg/FFprobe.
+    Aplica automaticamente flags para ocultar janela no Windows, encoding UTF-8 e tratamento de erros."""
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    return subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        timeout=timeout,
+        creationflags=creationflags,
+        check=check
+    )
 
 def salvar_caminho_ffmpeg(bin_dir: str) -> None:
     """Grava a pasta do FFmpeg nas configurações do app (lembrada na próxima vez)."""
@@ -33,7 +42,6 @@ def salvar_caminho_ffmpeg(bin_dir: str) -> None:
         QSettings("Vicio", "DublaSync").setValue("ffmpeg_bin", str(bin_dir))
     except Exception:
         pass
-
 
 def caminho_salvo_ffmpeg() -> Optional[str]:
     """Lê a pasta do FFmpeg salva anteriormente (ou None)."""
@@ -44,11 +52,9 @@ def caminho_salvo_ffmpeg() -> Optional[str]:
     except Exception:
         return None
 
-
 def winget_disponivel() -> bool:
     """Verifica se o Winget existe no sistema."""
     return shutil.which("winget") is not None
-
 
 def _candidate_bins() -> list:
     """Lista pastas candidatas fora do PATH (salva, WinGet, pasta local e comuns)."""
@@ -57,19 +63,22 @@ def _candidate_bins() -> list:
     salvo = caminho_salvo_ffmpeg()
     if salvo:
         roots.append(Path(salvo))
+
     local = os.environ.get("LOCALAPPDATA", "")
     prog = os.environ.get("ProgramFiles", r"C:\Program Files")
     prog64 = os.environ.get("ProgramW6432", prog)
     user = os.environ.get("USERPROFILE", "")
+
     if local:
         roots.append(Path(local) / "DublaSync" / "ffmpeg")
         roots.append(Path(local) / "Microsoft" / "WinGet" / "Packages")
-    roots.append(Path(prog) / "ffmpeg")
-    if Path(prog64) not in [Path(r) for r in roots]:
-        roots.append(Path(prog64) / "ffmpeg")
-    roots.append(Path(r"C:\ffmpeg"))
+        roots.append(Path(prog) / "ffmpeg")
+        if Path(prog64) not in [Path(r) for r in roots]:
+            roots.append(Path(prog64) / "ffmpeg")
+        roots.append(Path(r"C:\ffmpeg"))
     if user:
         roots.append(Path(user) / "ffmpeg")
+
     for root in roots:
         if not root.exists():
             continue
@@ -84,7 +93,6 @@ def _candidate_bins() -> list:
             pass
     return bins
 
-
 def find_ffmpeg_exe() -> Optional[str]:
     """Retorna o caminho do ffmpeg (PATH, caminho salvo ou pastas conhecidas)."""
     found = shutil.which("ffmpeg")
@@ -96,7 +104,6 @@ def find_ffmpeg_exe() -> Optional[str]:
             return str(exe)
     return None
 
-
 def refresh_path() -> Optional[str]:
     """Adiciona ao PATH do processo a pasta bin do FFmpeg encontrada fora do PATH."""
     if shutil.which("ffmpeg"):
@@ -105,7 +112,6 @@ def refresh_path() -> Optional[str]:
         os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
         return str(bin_dir)
     return None
-
 
 def add_to_user_path(bin_dir: str) -> bool:
     """Adiciona a pasta ao PATH do USUÁRIO do Windows de forma PERMANENTE."""
@@ -124,55 +130,46 @@ def add_to_user_path(bin_dir: str) -> bool:
             parts = [p for p in str(value).split(os.pathsep) if p.strip()]
             if bin_dir.lower().rstrip("\\") not in (p.lower().rstrip("\\") for p in parts):
                 parts.append(bin_dir)
-                winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ,
-                                  os.pathsep.join(parts))
-        result = ctypes.c_ulong()
-        ctypes.windll.user32.SendMessageTimeoutW(
-            0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, ctypes.byref(result)
-        )
-        atual = [p.lower().rstrip("\\") for p in os.environ.get("PATH", "").split(os.pathsep)]
-        if bin_dir.lower().rstrip("\\") not in atual:
-            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
-        return True
+                winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, os.pathsep.join(parts))
+            
+            result = ctypes.c_ulong()
+            ctypes.windll.user32.SendMessageTimeoutW(
+                0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, ctypes.byref(result)
+            )
+            atual = [p.lower().rstrip("\\") for p in os.environ.get("PATH", "").split(os.pathsep)]
+            if bin_dir.lower().rstrip("\\") not in atual:
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+            return True
     except Exception:
         return False
-
 
 def get_ffmpeg_version(exe: str = "ffmpeg") -> Optional[str]:
     """Retorna a versão do FFmpeg (primeira linha do 'ffmpeg -version')."""
     try:
-        result = subprocess.run([exe, "-version"], capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=15,
-                                creationflags=_creationflags())
+        result = run_ffmpeg_subprocess([exe, "-version"])
         first = (result.stdout or "").splitlines()[0].strip()
         match = re.search(r"ffmpeg version\s+([^\s]+)", first)
         return match.group(1) if match else (first or None)
     except Exception:
         return None
 
-
 def has_rubberband(exe: str = "ffmpeg") -> bool:
     """Verifica se o filtro 'rubberband' está disponível."""
     try:
-        result = subprocess.run([exe, "-hide_banner", "-filters"], capture_output=True,
-                                text=True, encoding="utf-8", errors="replace",
-                                timeout=15, creationflags=_creationflags())
+        result = run_ffmpeg_subprocess([exe, "-hide_banner", "-filters"])
         return bool(re.search(r"\brubberband\b", result.stdout))
     except Exception:
         return False
-
 
 def verify() -> Dict[str, object]:
     """Verificação completa: instalação, caminho, versão e suporte ao rubberband."""
     exe = find_ffmpeg_exe()
     if not exe:
-        return {"installed": False, "ok": False, "path": None,
-                "version": None, "rubberband": False}
+        return {"installed": False, "ok": False, "path": None, "version": None, "rubberband": False}
     version = get_ffmpeg_version(exe)
     rubberband = has_rubberband(exe)
     return {"installed": True, "ok": bool(version) and rubberband,
             "path": exe, "version": version, "rubberband": rubberband}
-
 
 def download_file(url: str, dest: Path,
                   progress_cb: Optional[Callable[[int], None]] = None,
@@ -192,7 +189,6 @@ def download_file(url: str, dest: Path,
             done += len(chunk)
             if progress_cb and total > 0:
                 progress_cb(min(99, int(done * 100 / total)))
-
 
 def extract_archive(archive_path: Path, dest_dir: Path) -> None:
     """Extrai um ZIP ou 7Z para a pasta de destino."""
