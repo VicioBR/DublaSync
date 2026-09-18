@@ -4,6 +4,8 @@ import re
 import shutil
 import subprocess
 import zipfile
+import hashlib
+import hmac
 from pathlib import Path
 from typing import Callable, Dict, Optional
 from urllib.request import Request, urlopen
@@ -16,14 +18,24 @@ except ImportError:
 
 # ID do pacote no Winget (build completa e ESTÁVEL do gyan.dev)
 WINGET_ID: str = "Gyan.FFmpeg"
-# Build de fallback ESTÁVEL oficial (Gyan.dev Release Full - inclui librubberband)
-FALLBACK_URL: str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
+# Build de fallback ESTÁVEL oficial. A variante Essentials inclui librubberband
+# e é disponibilizada em ZIP, formato extraído nativamente pelo Python. O
+# pacote Full é apenas .7z e usa BCJ2, filtro incompatível com o py7zr.
+FALLBACK_URL: str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+# O fornecedor publica o SHA-256 ao lado de cada arquivo de build. Validá-lo
+# evita extrair um download corrompido ou incompleto antes de usar o FFmpeg.
+FALLBACK_SHA256_URL: str = f"{FALLBACK_URL}.sha256"
 USER_AGENT: str = "DublaSync/1.0"
 
-def run_ffmpeg_subprocess(cmd: list, timeout: int = 15, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+
+def _creationflags() -> int:
+    """Retorna flags para evitar uma janela de console no Windows."""
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def run_ffmpeg_subprocess(cmd: list, timeout: int = 60, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
     """Wrapper centralizado para chamadas do FFmpeg/FFprobe.
     Aplica automaticamente flags para ocultar janela no Windows, encoding UTF-8 e tratamento de erros."""
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     return subprocess.run(
         cmd,
         capture_output=capture,
@@ -31,7 +43,7 @@ def run_ffmpeg_subprocess(cmd: list, timeout: int = 15, check: bool = True, capt
         encoding='utf-8',
         errors='replace',
         timeout=timeout,
-        creationflags=creationflags,
+        creationflags=_creationflags(),
         check=check
     )
 
@@ -39,7 +51,10 @@ def salvar_caminho_ffmpeg(bin_dir: str) -> None:
     """Grava a pasta do FFmpeg nas configurações do app (lembrada na próxima vez)."""
     try:
         from PySide6.QtCore import QSettings
-        QSettings("Vicio", "DublaSync").setValue("ffmpeg_bin", str(bin_dir))
+        settings = QSettings("Vicio", "DublaSync")
+        settings.setValue("ffmpeg_bin", str(bin_dir))
+        settings.remove("ffmpeg_requer_configuracao")
+        settings.sync()
     except Exception:
         pass
 
@@ -52,16 +67,92 @@ def caminho_salvo_ffmpeg() -> Optional[str]:
     except Exception:
         return None
 
+
+def remover_caminho_ffmpeg() -> None:
+    """Esquece o caminho salvo e exige uma nova configuração no DublaSync."""
+    try:
+        from PySide6.QtCore import QSettings
+        settings = QSettings("Vicio", "DublaSync")
+        settings.remove("ffmpeg_bin")
+        settings.setValue("ffmpeg_requer_configuracao", True)
+        settings.sync()
+    except Exception:
+        pass
+
+
+def ffmpeg_requer_configuracao() -> bool:
+    """Indica que o usuário redefiniu a configuração do FFmpeg no DublaSync."""
+    try:
+        from PySide6.QtCore import QSettings
+        valor = QSettings("Vicio", "DublaSync").value(
+            "ffmpeg_requer_configuracao", False
+        )
+        return str(valor).strip().lower() in {"true", "1", "yes", "sim"}
+    except Exception:
+        return False
+
+
+def marcar_ffmpeg_configurado() -> None:
+    """Registra que uma nova configuração do FFmpeg foi concluída."""
+    try:
+        from PySide6.QtCore import QSettings
+        settings = QSettings("Vicio", "DublaSync")
+        settings.remove("ffmpeg_requer_configuracao")
+        settings.sync()
+    except Exception:
+        pass
+
 def winget_disponivel() -> bool:
     """Verifica se o Winget existe no sistema."""
     return shutil.which("winget") is not None
 
-def _candidate_bins() -> list:
+def _ffmpeg_in_bin(bin_dir: str | Path) -> Optional[str]:
+    """Retorna o executável diretamente de uma pasta ``bin`` conhecida."""
+    try:
+        base = Path(bin_dir)
+        for filename in ("ffmpeg.exe", "ffmpeg"):
+            candidate = base / filename
+            if candidate.is_file():
+                return str(candidate)
+    except OSError:
+        return None
+    return None
+
+
+def find_ffmpeg_bin(directory: str | Path) -> Optional[str]:
+    """Localiza uma pasta ``bin`` que contenha um executável FFmpeg.
+
+    A busca é limitada à pasta indicada, o que permite validar exatamente a
+    instalação que acabou de ser escolhida ou extraída, sem reutilizar uma
+    configuração antiga salva pelo aplicativo.
+    """
+    try:
+        root = Path(directory)
+        if not root.is_dir():
+            return None
+        for candidate in (root, root / "bin"):
+            if _ffmpeg_in_bin(candidate):
+                return str(candidate)
+        for executable in root.rglob("ffmpeg.exe"):
+            if executable.is_file():
+                return str(executable.parent)
+    except OSError:
+        return None
+    return None
+
+
+def find_ffmpeg_exe_in(directory: str | Path) -> Optional[str]:
+    """Retorna o executável FFmpeg encontrado dentro de ``directory``."""
+    bin_dir = find_ffmpeg_bin(directory)
+    return _ffmpeg_in_bin(bin_dir) if bin_dir else None
+
+
+def _candidate_bins(include_saved: bool = True) -> list:
     """Lista pastas candidatas fora do PATH (salva, WinGet, pasta local e comuns)."""
     bins = []
     roots = []
     salvo = caminho_salvo_ffmpeg()
-    if salvo:
+    if include_saved and salvo:
         roots.append(Path(salvo))
 
     local = os.environ.get("LOCALAPPDATA", "")
@@ -70,47 +161,71 @@ def _candidate_bins() -> list:
     user = os.environ.get("USERPROFILE", "")
 
     if local:
-        roots.append(Path(local) / "DublaSync" / "ffmpeg")
         roots.append(Path(local) / "Microsoft" / "WinGet" / "Packages")
-        roots.append(Path(prog) / "ffmpeg")
-        if Path(prog64) not in [Path(r) for r in roots]:
-            roots.append(Path(prog64) / "ffmpeg")
-        roots.append(Path(r"C:\ffmpeg"))
+        roots.append(Path(local) / "DublaSync" / "ffmpeg")
+    roots.append(Path(prog) / "ffmpeg")
+    if Path(prog64) not in roots:
+        roots.append(Path(prog64) / "ffmpeg")
+    roots.append(Path(r"C:\ffmpeg"))
     if user:
         roots.append(Path(user) / "ffmpeg")
 
     for root in roots:
-        if not root.exists():
-            continue
-        if (root / "bin" / "ffmpeg.exe").exists():
-            bins.append(root / "bin")
-            continue
-        try:
-            for exe in root.rglob("ffmpeg.exe"):
-                bins.append(exe.parent)
-                break
-        except Exception:
-            pass
+        bin_dir = find_ffmpeg_bin(root)
+        if bin_dir:
+            bins.append(Path(bin_dir))
     return bins
 
+def _prioritize_process_path(bin_dir: str | Path) -> str:
+    """Move uma pasta válida para o início do PATH apenas desta execução."""
+    normalized = str(Path(bin_dir))
+    current = os.environ.get("PATH", "")
+    key = normalized.lower().rstrip("\\/")
+    entries = [entry for entry in current.split(os.pathsep) if entry.strip()]
+    entries = [entry for entry in entries if entry.lower().rstrip("\\/") != key]
+    os.environ["PATH"] = os.pathsep.join([normalized, *entries])
+    return normalized
+
+
 def find_ffmpeg_exe() -> Optional[str]:
-    """Retorna o caminho do ffmpeg (PATH, caminho salvo ou pastas conhecidas)."""
+    """Retorna o FFmpeg configurado pelo usuário antes de consultar o PATH."""
+    saved = caminho_salvo_ffmpeg()
+    if saved:
+        configured = _ffmpeg_in_bin(saved)
+        if configured:
+            return configured
     found = shutil.which("ffmpeg")
     if found:
         return found
     for bin_dir in _candidate_bins():
-        exe = bin_dir / "ffmpeg.exe"
-        if exe.exists():
-            return str(exe)
+        exe = _ffmpeg_in_bin(bin_dir)
+        if exe:
+            return exe
     return None
 
-def refresh_path() -> Optional[str]:
-    """Adiciona ao PATH do processo a pasta bin do FFmpeg encontrada fora do PATH."""
-    if shutil.which("ffmpeg"):
+def refresh_path(prefer_candidate: bool = False) -> Optional[str]:
+    """Prioriza no PATH a configuração salva ou uma instalação recém-localizada.
+
+    ``prefer_candidate`` é usado após instalar o FFmpeg: mesmo que exista uma
+    versão antiga no PATH, uma instalação encontrada nas pastas conhecidas
+    passa a ser verificada nesta sessão.
+    """
+    # Após uma instalação, não deixe uma rota salva antiga mascarar o novo
+    # executável. O chamador valida e persiste o candidato somente se ele for
+    # de fato compatível com o DublaSync.
+    if prefer_candidate:
+        for bin_dir in _candidate_bins(include_saved=False):
+            if _ffmpeg_in_bin(bin_dir):
+                return _prioritize_process_path(bin_dir)
+
+    saved = caminho_salvo_ffmpeg()
+    if saved and _ffmpeg_in_bin(saved):
+        return _prioritize_process_path(saved)
+    if not prefer_candidate and shutil.which("ffmpeg"):
         return None
     for bin_dir in _candidate_bins():
-        os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-        return str(bin_dir)
+        if _ffmpeg_in_bin(bin_dir):
+            return _prioritize_process_path(bin_dir)
     return None
 
 def add_to_user_path(bin_dir: str) -> bool:
@@ -161,19 +276,67 @@ def has_rubberband(exe: str = "ffmpeg") -> bool:
     except Exception:
         return False
 
-def verify() -> Dict[str, object]:
-    """Verificação completa: instalação, caminho, versão e suporte ao rubberband."""
-    exe = find_ffmpeg_exe()
+
+def has_ffprobe(ffmpeg_exe: str) -> bool:
+    """Confirma que o FFprobe correspondente está disponível e executável."""
+    executable = Path(ffmpeg_exe)
+    probe_name = "ffprobe.exe" if executable.suffix.lower() == ".exe" else "ffprobe"
+    ffprobe_exe = executable.with_name(probe_name)
+    if not ffprobe_exe.is_file():
+        return False
+    try:
+        result = run_ffmpeg_subprocess([str(ffprobe_exe), "-version"])
+        first_line = (result.stdout or "").splitlines()[0].lower()
+        return "ffprobe version" in first_line
+    except Exception:
+        return False
+
+
+def verify(executable_path: Optional[str] = None) -> Dict[str, object]:
+    """Verifica um FFmpeg específico ou a instalação atualmente configurada."""
+    exe = executable_path or find_ffmpeg_exe()
+    if executable_path and not Path(executable_path).is_file():
+        exe = None
     if not exe:
-        return {"installed": False, "ok": False, "path": None, "version": None, "rubberband": False}
+        return {
+            "installed": False, "ok": False, "path": None, "version": None,
+            "rubberband": False, "ffprobe": False,
+        }
     version = get_ffmpeg_version(exe)
     rubberband = has_rubberband(exe)
-    return {"installed": True, "ok": bool(version) and rubberband,
-            "path": exe, "version": version, "rubberband": rubberband}
+    ffprobe = has_ffprobe(exe)
+    return {"installed": True, "ok": bool(version) and rubberband and ffprobe,
+            "path": exe, "version": version, "rubberband": rubberband,
+            "ffprobe": ffprobe}
+
+def obter_checksum_sha256(url: str) -> str:
+    """Lê e normaliza o SHA-256 publicado pelo fornecedor do arquivo."""
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(request, timeout=60) as response:
+        text = response.read().decode("utf-8", errors="replace")
+    match = re.search(r"\b([a-fA-F0-9]{64})\b", text)
+    if not match:
+        raise RuntimeError("O fornecedor não publicou um SHA-256 válido para o arquivo.")
+    return match.group(1).lower()
+
+
+def verificar_checksum_sha256(path: Path, esperado: str) -> None:
+    """Confirma a integridade de um arquivo antes de extraí-lo."""
+    esperado_normalizado = (esperado or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", esperado_normalizado):
+        raise ValueError("SHA-256 esperado inválido.")
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if not hmac.compare_digest(digest.hexdigest(), esperado_normalizado):
+        raise RuntimeError("A verificação de integridade do download do FFmpeg falhou.")
+
 
 def download_file(url: str, dest: Path,
                   progress_cb: Optional[Callable[[int], None]] = None,
-                  cancel_cb: Optional[Callable[[], bool]] = None) -> None:
+                  cancel_cb: Optional[Callable[[], bool]] = None,
+                  expected_sha256: Optional[str] = None) -> None:
     """Baixa um arquivo com callback de progresso (0-99) e suporte a cancelamento."""
     request = Request(url, headers={"User-Agent": USER_AGENT})
     with urlopen(request, timeout=60) as response, open(dest, "wb") as out:
@@ -189,6 +352,19 @@ def download_file(url: str, dest: Path,
             done += len(chunk)
             if progress_cb and total > 0:
                 progress_cb(min(99, int(done * 100 / total)))
+    if expected_sha256:
+        verificar_checksum_sha256(dest, expected_sha256)
+
+def _validate_archive_members(member_names, dest_dir: Path) -> None:
+    """Impede arquivos de arquivo compactado de escaparem da pasta destino."""
+    destination = dest_dir.resolve()
+    for name in member_names:
+        target = (dest_dir / name).resolve()
+        try:
+            target.relative_to(destination)
+        except ValueError as exc:
+            raise RuntimeError("Arquivo compactado contém um caminho inseguro.") from exc
+
 
 def extract_archive(archive_path: Path, dest_dir: Path) -> None:
     """Extrai um ZIP ou 7Z para a pasta de destino."""
@@ -197,9 +373,11 @@ def extract_archive(archive_path: Path, dest_dir: Path) -> None:
         if not HAS_PY7ZR:
             raise RuntimeError("Biblioteca 'py7zr' não encontrada. Rode 'pip install py7zr'.")
         with py7zr.SevenZipFile(archive_path, mode='r') as z:
+            _validate_archive_members(z.getnames(), dest_dir)
             z.extractall(path=dest_dir)
     elif nome.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as z:
+            _validate_archive_members((item.filename for item in z.infolist()), dest_dir)
             z.extractall(dest_dir)
     else:
         raise ValueError("Formato de arquivo não suportado.")
